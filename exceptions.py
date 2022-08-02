@@ -5,3 +5,12 @@ class EnvVariableError(Exception):
     """
 
     pass
+
+
+class APIAnswerStatusCodeError(Exception):
+    """Ошибка статуса кода у ответа от API.
+    Вызывается в случае получения ответа от API со статусом кода,
+    отличным от 200.
+    """
+
+    pass

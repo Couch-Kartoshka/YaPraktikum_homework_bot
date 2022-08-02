@@ -9,29 +9,22 @@
 - При обновлении статуса анализируется ответ API
 - При корректном статусе отправляется соответствующее уведомление в Telegram.
 """
+
 import logging
 import os
 import sys
 import time
 from http import HTTPStatus
-from urllib.error import HTTPError
+from json.decoder import JSONDecodeError
+from typing import Dict, List, Union
 
 import requests
-import telegram
 from dotenv import load_dotenv
+from telegram import Bot
 
-from exceptions import EnvVariableError
+from exceptions import APIAnswerStatusCodeError, EnvVariableError
 
 load_dotenv()
-
-# Настройки логирования:
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-handler = logging.StreamHandler(sys.stdout)
-handler.setFormatter(logging.Formatter(
-    '%(asctime)s [%(levelname)s] - %(message)s'
-))
-logger.addHandler(handler)
 
 # Обязательные переменные окружения:
 PRACTICUM_TOKEN = os.getenv('PRACTICUM_TOKEN')
@@ -50,8 +43,29 @@ HOMEWORK_STATUSES = {
     'rejected': 'Работа проверена: у ревьюера есть замечания.'
 }
 
+# Псевдонимы типов:
+CustomDict = Dict[str, Union[List[Dict[str, Union[str, int]]], int]]
+CustomList = List[Dict[str, Union[str, int]]]
 
-def send_message(bot, message: str) -> None:
+
+def init_logger() -> logging.Logger:
+    """Инициализация логгера."""
+    logger = logging.getLogger(__name__)
+    logger.setLevel(logging.DEBUG)
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(logging.Formatter(
+        '%(asctime)s [%(levelname)s] в функции %(funcName)s - %(message)s'
+    ))
+    logger.addHandler(handler)
+
+    logger.info('Инициализация логгера выполнена успешно.')
+    return logger
+
+
+logger = init_logger()
+
+
+def send_message(bot: Bot, message: str) -> None:
     """Отправка сообщения в Telegram чат."""
     try:
         bot.send_message(TELEGRAM_CHAT_ID, message)
@@ -63,85 +77,115 @@ def send_message(bot, message: str) -> None:
         )
 
 
-def get_api_answer(current_timestamp: int) -> dict:
+def get_api_answer(current_timestamp: int) -> CustomDict:
     """Запрос к эндпоинту API сервиса."""
     timestamp = current_timestamp or int(time.time())
     params = {'from_date': timestamp}
 
-    response = requests.get(ENDPOINT, headers=HEADERS, params=params)
-    if response.status_code != HTTPStatus.OK:
-        raise HTTPError(
-            (f'Эндпоинт {ENDPOINT} недоступен. '
-             f'Код ответа API: {response.status_code}.')
-        )
-    return response.json()
+    try:
+        response = requests.get(ENDPOINT, headers=HEADERS, params=params)
+        if response.status_code != HTTPStatus.OK:
+            message = (f'Эндпоинт {ENDPOINT} недоступен. '
+                       f'Код ответа API: {response.status_code}.')
+            logger.error(message)
+            raise APIAnswerStatusCodeError(message)
+    except requests.RequestException as error:
+        message = ('Произошла ошибка при обработке запроса '
+                   f'к эндпоинту {ENDPOINT}.')
+        logger.error(message)
+        raise error(message)
+
+    try:
+        response.json()
+        logger.info(f'Запрос к эндпоинту {ENDPOINT} выполнен успешно.')
+        return response.json()
+    except JSONDecodeError as error:
+        message = f'Эндпоинт {ENDPOINT} передал ответ не в формате json.'
+        logger.error(message)
+        raise error(message)
 
 
-def check_response(response: dict) -> list:
+def check_response(response: CustomDict) -> CustomList:
     """Проверка ответа API сервиса на корректность."""
-    if type(response) is not dict:
-        raise TypeError(
-            (f'Неверный тип данных ответа от эндпоинта {ENDPOINT}. '
-             f'Требуется словарь, текущий тип - {type(response)}.')
-        )
-    if 'homeworks' and 'current_date' not in response.keys():
-        raise KeyError(
-            (f'Ответ от эндпоинта {ENDPOINT} не содержит данные про '
-              '"homeworks" и "current_date".')
-        )
+    if not isinstance(response, dict):
+        message = (f'Неверный тип данных ответа от эндпоинта {ENDPOINT}. '
+                   f'Требуется словарь, текущий тип - {type(response)}.')
+        logger.error(message)
+        raise TypeError(message)
+    if 'homeworks' not in response:
+        message = (f'Ответ от эндпоинта {ENDPOINT} не содержит данные про '
+                   '"homeworks".')
+        logger.error(message)
+        raise KeyError(message)
+    if 'current_date' not in response:
+        message = (f'Ответ от эндпоинта {ENDPOINT} не содержит данные про '
+                   '"current_date".')
+        logger.error(message)
+        raise KeyError(message)
 
     homeworks = response['homeworks']
     current_date = response['current_date']
 
-    if type(homeworks) is not list:
-        raise TypeError(
-            'Тип данных значения ключа "homeworks" не является списком.'
-        )
-    if type(current_date) is not int:
-        raise TypeError(
-            ('Тип данных значения ключа "current_date" не является '
-             'целым числом.')
-        )
+    if not isinstance(homeworks, list):
+        message = 'Тип данных значения ключа "homeworks" не является списком.'
+        logger.error(message)
+        raise TypeError(message)
+    if not isinstance(current_date, int):
+        message = ('Тип данных значения ключа "current_date" не является '
+                   'целым числом.')
+        logger.error(message)
+        raise TypeError(message)
+
+    logger.info(f'Проверка ответа от эндпоинта {ENDPOINT} проведена успешно.')
     return homeworks
 
 
-def parse_status(homework: dict) -> str:
+def parse_status(homework: Dict[str, Union[str, int]]) -> str:
     """Извлечение статуса домашней работы из ответа API сервиса."""
-    if 'homework_name' and 'status' not in homework.keys():
-        raise KeyError(
-            ('Данные о домашней работе не содержат информацию про '
-             '"homework_name" и "status".')
-        )
+    if 'homework_name' not in homework:
+        message = ('Данные о домашней работе не содержат информацию про '
+                   '"homework_name".')
+        logger.error(message)
+        raise KeyError(message)
+    if 'status' not in homework:
+        message = ('Данные о домашней работе не содержат информацию про '
+                   '"status".')
+        logger.error(message)
+        raise KeyError(message)
 
     homework_name = homework['homework_name']
     homework_status = homework['status']
 
-    if homework_status not in HOMEWORK_STATUSES.keys():
-        raise KeyError(
-            'Данные о домашней работе содержат недокументированный статус.'
-        )
+    if homework_status not in HOMEWORK_STATUSES:
+        message = ('Данные о домашней работе содержат недокументированный '
+                   f'статус - {homework_status}.')
+        logger.error(message)
+        raise KeyError(message)
 
     verdict = HOMEWORK_STATUSES[homework_status]
+    logger.info('Извлечение статуса домашней работы проведено успешно.')
     return f'Изменился статус проверки работы "{homework_name}". {verdict}'
 
 
 def check_tokens() -> bool:
     """Проверка доступности обязательных переменных окружения."""
-    if PRACTICUM_TOKEN and TELEGRAM_CHAT_ID and TELEGRAM_TOKEN:
+    if all([PRACTICUM_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_TOKEN]):
+        logger.info('Проверка доступности обязательных переменных окружения '
+                    'проведена успешно.')
         return True
+    logger.critical(
+        ('Отсутствует обязательная(-ые) переменная(-ые) окружения. '
+         'Программа будет принудительно остановлена.')
+    )
     return False
 
 
 def main() -> None:
     """Основная логика работы бота."""
     if check_tokens() is False:
-        logger.critical(
-            ('Отсутствует обязательная(-ые) переменная(-ые) окружения. '
-             'Программа принудительно остановлена.')
-        )
         raise EnvVariableError
 
-    bot = telegram.Bot(token=TELEGRAM_TOKEN)
+    bot = Bot(token=TELEGRAM_TOKEN)
     current_timestamp = int(time.time())
     previous_error_message = []
 
